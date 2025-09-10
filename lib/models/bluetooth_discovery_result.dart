@@ -1,0 +1,15 @@
+part of '../bluetooth_classic_multiplatform.dart';
+
+class BluetoothDiscoveryResult {
+  final BluetoothDevice device;
+  final int rssi;
+
+  BluetoothDiscoveryResult({required this.device, this.rssi = 0});
+
+  factory BluetoothDiscoveryResult.fromMap(Map map) {
+    return BluetoothDiscoveryResult(
+      device: BluetoothDevice.fromMap(map),
+      rssi: map['rssi'] ?? 0,
+    );
+  }
+}
