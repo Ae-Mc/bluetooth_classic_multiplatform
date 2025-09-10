@@ -1,5 +1,5 @@
 name: bluetooth_classic_multiplatform
-description: "A new Flutter plugin project."
+description: "A flutter plugin for communicating with bluetooth classic devices"
 version: 0.1.0
 homepage: https://github.com/ae-mc/bluetooth_classic_multiplatform
 
