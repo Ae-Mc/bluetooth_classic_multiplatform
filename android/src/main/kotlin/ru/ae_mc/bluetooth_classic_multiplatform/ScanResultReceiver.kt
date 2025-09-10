@@ -35,6 +35,7 @@ class ScanResultReceiver : EventChannel.StreamHandler {
                                         BluetoothDevice::class.java
                                 )
                             } else {
+                                @Suppress("DEPRECATION")
                                 intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
                             }
 

@@ -54,14 +54,14 @@ abstract class BluetoothConnection(private val bluetoothAdapter: BluetoothAdapte
         // Cancel discovery just to be sure
         bluetoothAdapter.cancelDiscovery()
         try {
-            socket.connect();
+            socket.connect()
         } catch (e: IOException) {
             try {
                 // Newer versions of android may require voodoo; see https://stackoverflow.com/a/25647197
                 socket = device::class.java.getMethod("createRfcommSocket", Int::class.javaPrimitiveType).invoke(device,1) as BluetoothSocket
-                socket.connect();
+                socket.connect()
             } catch (e2: Exception) {
-                throw IOException("Failed to connect", e2);
+                throw IOException("Failed to connect", e2)
             }
         }
         connectionThread = ConnectionThread(socket).also { it.start() }
