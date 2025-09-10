@@ -1,11 +1,11 @@
 name: bluetooth_classic_multiplatform
 description: "A new Flutter plugin project."
-version: 0.0.1
-homepage:
+version: 0.1.0
+homepage: https://github.com/ae-mc/bluetooth_classic_multiplatform
 
 environment:
   sdk: ^3.8.1
-  flutter: '>=3.3.0'
+  flutter: ">=3.3.0"
 
 dependencies:
   flutter:
@@ -15,7 +15,7 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^5.0.0
+  flutter_lints: ^6.0.0
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -37,8 +37,8 @@ flutter:
       android:
         package: ru.ae_mc.bluetooth_classic_multiplatform
         pluginClass: BluetoothClassicMultiplatformPlugin
-      ios:
-        pluginClass: BluetoothClassicMultiplatformPlugin
+      # ios:
+      #   pluginClass: BluetoothClassicMultiplatformPlugin
       windows:
         pluginClass: BluetoothClassicMultiplatformPluginCApi
 
