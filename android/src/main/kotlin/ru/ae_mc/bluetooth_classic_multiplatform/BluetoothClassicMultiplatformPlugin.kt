@@ -2,25 +2,21 @@ package ru.ae_mc.bluetooth_classic_multiplatform
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.Activity
+import android.app.Application
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.os.AsyncTask
 import android.os.Build
-import android.provider.Settings
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.util.SparseArray
-import androidx.annotation.RequiresApi
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
+import androidx.core.app.ActivityCompat.startActivityForResult
+import androidx.core.content.ContextCompat.getSystemService
 import io.flutter.embedding.engine.plugins.FlutterPlugin
-import io.flutter.embedding.engine.plugins.FlutterPlugin.FlutterPluginBinding
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.BinaryMessenger
@@ -29,1127 +25,626 @@ import io.flutter.plugin.common.EventChannel.EventSink
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
-import java.io.PrintWriter
-import java.io.StringWriter
-import java.net.NetworkInterface
-import ru.ae_mc.bluetooth_classic_multiplatform.BluetoothConnectionBase.OnDisconnectedCallback
-import ru.ae_mc.bluetooth_classic_multiplatform.BluetoothConnectionBase.OnReadCallback
+import io.flutter.plugin.common.MethodChannel.Result
+import java.util.UUID
+import java.util.concurrent.Executors
 
-class BluetoothClassicMultiplatformPlugin : FlutterPlugin, ActivityAware {
+/** FlutterBlueClassicPlugin */
+class BluetoothClassicMultiplatformPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
+
     companion object {
-        // Plugin
-        private const val TAG = "BluetoothClassicMultiplatform"
-        private const val PLUGIN_NAMESPACE = "bluetooth_classic_multiplatform"
-
-        // Permissions and request constants
-        private const val REQUEST_COARSE_LOCATION_PERMISSIONS = 1451
-        private const val REQUEST_ENABLE_BLUETOOTH = 1337
-        private const val REQUEST_DISCOVERABLE_BLUETOOTH = 2137
-
-        /** Helper function to get string out of exception */
-        private fun exceptionToString(ex: Exception): String {
-            val sw = StringWriter()
-            val pw = PrintWriter(sw)
-            ex.printStackTrace(pw)
-            return sw.toString()
-        }
-
-        /** Helper function to check is device connected */
-        private fun checkIsDeviceConnected(device: BluetoothDevice): Boolean {
-            try {
-                val method = device.javaClass.getMethod("isConnected")
-                return method.invoke(device) as Boolean
-            } catch (ex: Exception) {
-                return false
-            }
-        }
+        const val TAG: String = "bluetooth_classic_mpfm"
     }
 
-    private var methodChannel: MethodChannel? = null
-    private var pendingResultForActivityResult: MethodChannel.Result? = null
+    /// The MethodChannel that will the communication between Flutter and native Android
+    ///
+    /// This local reference serves to register the plugin with the Flutter Engine and unregister it
+    /// when the Flutter Engine is detached from the Activity
+    private lateinit var methodChannel: MethodChannel
 
-    // General Bluetooth
+    private var activityPluginBinding: ActivityPluginBinding? = null
+    private var binaryMessenger: BinaryMessenger? = null
+
+    private lateinit var adapterStateChannel: EventChannel
+    private lateinit var adapterStateReceiver: AdapterStateReceiver
+
+    private lateinit var scanResultChannel: EventChannel
+    private lateinit var scanResultReceiver: ScanResultReceiver
+
+    private lateinit var discoveryStateChannel: EventChannel
+    private lateinit var discoveryStateReceiver: DiscoveryStateReceiver
+
+    private lateinit var permissionManager: PermissionManager
     private var bluetoothAdapter: BluetoothAdapter? = null
 
-    // State
-    private val stateReceiver: BroadcastReceiver
-    private var stateSink: EventSink? = null
-
-    // Pairing requests
-    private val pairingRequestReceiver: BroadcastReceiver
-    private var isPairingRequestHandlerSet = false
-    private var bondStateBroadcastReceiver: BroadcastReceiver? = null
-
-    private var discoverySink: EventSink? = null
-    private val discoveryReceiver: BroadcastReceiver
-
-    // Connections
-    /** Contains all active connections. Maps ID of the connection with plugin data channels. */
-    private val connections = SparseArray<BluetoothConnection?>(2)
-
-    /** Last ID given to any connection, used to avoid duplicate IDs */
+    private val connections = SparseArray<BluetoothConnectionWrapper>(2)
     private var lastConnectionId = 0
-    private var activity: Activity? = null
-    private var messenger: BinaryMessenger? = null
-    private var activeContext: Context? = null
 
-    override fun onAttachedToEngine(binding: FlutterPluginBinding) {
-        Log.v(TAG, "Attached to engine")
-        //        if (true) throw new RuntimeException("FlutterBluetoothSerial Attached to engine");
-        messenger = binding.binaryMessenger
+    private var context: Application? = null
 
-        methodChannel = MethodChannel(messenger!!, PLUGIN_NAMESPACE + "/methods")
-        methodChannel!!.setMethodCallHandler(FlutterBluetoothSerialMethodCallHandler())
+    override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
+        methodChannel =
+                MethodChannel(flutterPluginBinding.binaryMessenger, Helper.METHOD_CHANNEL_NAME)
+        methodChannel.setMethodCallHandler(this)
+        binaryMessenger = flutterPluginBinding.binaryMessenger
 
-        val stateChannel = EventChannel(messenger, PLUGIN_NAMESPACE + "/state")
-
-        stateChannel.setStreamHandler(
-                object : EventChannel.StreamHandler {
-                    override fun onListen(o: Any, eventSink: EventSink) {
-                        stateSink = eventSink
-
-                        activeContext!!.registerReceiver(
-                                stateReceiver,
-                                IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-                        )
-                    }
-
-                    override fun onCancel(o: Any) {
-                        stateSink = null
-                        try {
-                            activeContext!!.unregisterReceiver(stateReceiver)
-                        } catch (ex: IllegalArgumentException) {
-                            // Ignore `Receiver not registered` exception
-                        }
-                    }
-                }
+        // Adapter State Stream
+        adapterStateReceiver = AdapterStateReceiver()
+        adapterStateChannel =
+                EventChannel(
+                        flutterPluginBinding.binaryMessenger,
+                        AdapterStateReceiver.CHANNEL_NAME
+                )
+        adapterStateChannel.setStreamHandler(adapterStateReceiver)
+        val filterAdapter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        flutterPluginBinding.applicationContext.registerReceiver(
+                adapterStateReceiver.mBluetoothAdapterStateReceiver,
+                filterAdapter
         )
 
-        // Discovery
-        val discoveryChannel = EventChannel(messenger, PLUGIN_NAMESPACE + "/discovery")
+        // Scan Result Stream
+        scanResultReceiver = ScanResultReceiver()
+        scanResultChannel =
+                EventChannel(flutterPluginBinding.binaryMessenger, ScanResultReceiver.CHANNEL_NAME)
+        scanResultChannel.setStreamHandler(scanResultReceiver)
+        val filterScanResults = IntentFilter(BluetoothDevice.ACTION_FOUND)
+        flutterPluginBinding.applicationContext.registerReceiver(
+                scanResultReceiver.scanResultReceiver,
+                filterScanResults
+        )
 
-        // Ignore `Receiver not registered` exception
-        val discoveryStreamHandler: EventChannel.StreamHandler =
-                object : EventChannel.StreamHandler {
-                    override fun onListen(o: Any?, eventSink: EventSink) {
-                        discoverySink = eventSink
-                    }
+        // Discovery State Stream
+        discoveryStateReceiver = DiscoveryStateReceiver()
+        discoveryStateChannel =
+                EventChannel(
+                        flutterPluginBinding.binaryMessenger,
+                        DiscoveryStateReceiver.CHANNEL_NAME
+                )
+        discoveryStateChannel.setStreamHandler(discoveryStateReceiver)
+        val filterDiscoveryState = IntentFilter()
+        filterDiscoveryState.addAction(BluetoothAdapter.ACTION_DISCOVERY_STARTED)
+        filterDiscoveryState.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+        flutterPluginBinding.applicationContext.registerReceiver(
+                discoveryStateReceiver.discoveryStateReceiver,
+                filterDiscoveryState
+        )
 
-                    override fun onCancel(o: Any?) {
-                        Log.d(TAG, "Canceling discovery (stream closed)")
-                        try {
-                            activeContext!!.unregisterReceiver(discoveryReceiver)
-                        } catch (ex: IllegalArgumentException) {
-                            // Ignore `Receiver not registered` exception
-                        }
+        this.context = flutterPluginBinding.applicationContext as Application
 
-                        bluetoothAdapter!!.cancelDiscovery()
-
-                        if (discoverySink != null) {
-                            discoverySink!!.endOfStream()
-                            discoverySink = null
-                        }
-                    }
-                }
-        discoveryChannel.setStreamHandler(discoveryStreamHandler)
-    }
-
-    override fun onDetachedFromEngine(binding: FlutterPluginBinding) {
-        if (methodChannel != null) methodChannel!!.setMethodCallHandler(null)
+        val bluetoothManager =
+                getSystemService(
+                        flutterPluginBinding.applicationContext,
+                        BluetoothManager::class.java
+                )
+        bluetoothAdapter = bluetoothManager?.adapter
     }
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
-        //        if (true) throw new RuntimeException("FlutterBluetoothSerial Attached to
-        // activity");
-        this.activity = binding.activity
-        val bluetoothManager =
-                checkNotNull(
-                        activity!!.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-                )
-        this.bluetoothAdapter = bluetoothManager.adapter
+        activityPluginBinding = binding
+        permissionManager = PermissionManager(context!!.applicationContext, binding.activity)
+        binding.addRequestPermissionsResultListener(permissionManager)
+    }
 
-        binding.addActivityResultListener { requestCode: Int, resultCode: Int, data: Intent? ->
-            when (requestCode) {
-                REQUEST_ENABLE_BLUETOOTH -> {
-                    // @TODO - used underlying value of `Activity.RESULT_CANCELED` since we tend to
-                    // use `androidx` in which I were not able to find the constant.
-                    if (pendingResultForActivityResult != null) {
-                        pendingResultForActivityResult!!.success(resultCode != 0)
-                    }
-                    return@addActivityResultListener true
-                }
-                REQUEST_DISCOVERABLE_BLUETOOTH -> {
-                    pendingResultForActivityResult!!.success(
-                            if (resultCode == 0) -1 else resultCode
+    override fun onDetachedFromActivity() {
+        activityPluginBinding?.removeRequestPermissionsResultListener(permissionManager)
+        activityPluginBinding = null
+        permissionManager.setActivity(null)
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        onDetachedFromActivity()
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        onAttachedToActivity(binding)
+    }
+
+    override fun onMethodCall(call: MethodCall, result: Result) {
+        when (call.method) {
+            "isSupported" -> result.success(checkBluetoothSupport())
+            "isEnabled" -> result.success(isBluetoothEnabled())
+            "requestEnable" -> requestEnable(result)
+            "getAdapterState" -> result.success(getAdapterState())
+            "bondedDevices" -> getBondedDevices(result)
+            "startScan" -> startScan(result, call.argument<Boolean>("usesFineLocation") ?: false)
+            "stopScan" -> stopScan(result)
+            "isScanningNow" -> isScanningNow(result)
+            "bondDevice" -> bondDevice(result, call.argument<String>("address") ?: "")
+            "connect" ->
+                    connect(
+                            result,
+                            call.argument<String>("address") ?: "",
+                            call.argument<String>("uuid")
                     )
-                    return@addActivityResultListener true
-                }
-                else -> return@addActivityResultListener false
-            }
-        }
-        binding.addRequestPermissionsResultListener {
-                requestCode: Int,
-                permissions: Array<String?>?,
-                grantResults: IntArray ->
-            when (requestCode) {
-                REQUEST_COARSE_LOCATION_PERMISSIONS -> {
-                    pendingPermissionsEnsureCallbacks!!.onResult(
-                            grantResults[0] == PackageManager.PERMISSION_GRANTED
-                    )
-                    pendingPermissionsEnsureCallbacks = null
-                    return@addRequestPermissionsResultListener true
-                }
-            }
-            false
-        }
-        activity = binding.activity
-        activeContext = binding.activity.applicationContext
-    }
-
-    override fun onDetachedFromActivityForConfigChanges() {}
-
-    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {}
-
-    override fun onDetachedFromActivity() {}
-
-    fun interface EnsurePermissionsCallback {
-        fun onResult(granted: Boolean)
-    }
-
-    var pendingPermissionsEnsureCallbacks: EnsurePermissionsCallback? = null
-
-    /** Constructs the plugin instance */
-    init {
-        // State
-
-        stateReceiver =
-                object : BroadcastReceiver() {
-                    override fun onReceive(context: Context, intent: Intent) {
-                        if (stateSink == null) {
-                            return
-                        }
-
-                        val action = intent.action
-                        when (action) {
-                            BluetoothAdapter.ACTION_STATE_CHANGED -> {
-                                // Disconnect all connections
-                                val size = connections.size()
-                                var i = 0
-                                while (i < size) {
-                                    val connection = connections.valueAt(i)
-                                    connection!!.disconnect()
-                                    i++
-                                }
-                                connections.clear()
-
-                                stateSink!!.success(
-                                        intent.getIntExtra(
-                                                BluetoothAdapter.EXTRA_STATE,
-                                                BluetoothDevice.ERROR
-                                        )
-                                )
-                            }
-                        }
-                    }
-                }
-
-        // Pairing requests
-        pairingRequestReceiver =
-                object : BroadcastReceiver() {
-                    override fun onReceive(context: Context, intent: Intent) {
-                        when (intent.action) {
-                            BluetoothDevice.ACTION_PAIRING_REQUEST -> {
-                                val device =
-                                        intent.getParcelableExtra<BluetoothDevice>(
-                                                BluetoothDevice.EXTRA_DEVICE
-                                        )
-                                val pairingVariant =
-                                        intent.getIntExtra(
-                                                BluetoothDevice.EXTRA_PAIRING_VARIANT,
-                                                BluetoothDevice.ERROR
-                                        )
-                                Log.d(
-                                        TAG,
-                                        "Pairing request (variant " +
-                                                pairingVariant +
-                                                ") incoming from " +
-                                                device!!.address
-                                )
-                                when (pairingVariant) {
-                                    BluetoothDevice
-                                            .PAIRING_VARIANT_PIN -> // Simplest method - 4 digit
-                                        // number
-                                    {
-                                        val broadcastResult = this.goAsync()
-
-                                        val arguments: MutableMap<String, Any> = HashMap()
-                                        arguments["address"] = device.address
-                                        arguments["variant"] = pairingVariant
-
-                                        methodChannel!!.invokeMethod(
-                                                "handlePairingRequest",
-                                                arguments,
-                                                object : MethodChannel.Result {
-                                                    override fun success(handlerResult: Any?) {
-                                                        Log.d(TAG, handlerResult.toString())
-                                                        if (handlerResult is String) {
-                                                            try {
-                                                                val passkeyString = handlerResult
-                                                                val passkey =
-                                                                        passkeyString.toByteArray()
-                                                                Log.d(
-                                                                        TAG,
-                                                                        "Trying to set passkey for pairing to $passkeyString"
-                                                                )
-                                                                device.setPin(passkey)
-                                                                broadcastResult.abortBroadcast()
-                                                            } catch (ex: Exception) {
-                                                                Log.e(TAG, ex.message!!)
-                                                                ex.printStackTrace()
-                                                                // @TODO , passing the error
-                                                                // result.error("bond_error",
-                                                                // "Setting passkey for pairing
-                                                                // failed", exceptionToString(ex));
-                                                            }
-                                                        } else {
-                                                            Log.d(
-                                                                    TAG,
-                                                                    "Manual pin pairing in progress"
-                                                            )
-                                                            // Intent intent = new
-                                                            // Intent(BluetoothAdapter.ACTION_PAIRING_REQUEST);
-                                                            // intent.putExtra(BluetoothDevice.EXTRA_DEVICE, device);
-                                                            // intent.putExtra(BluetoothDevice.EXTRA_PAIRING_VARIANT, pairingVariant)
-                                                            ActivityCompat.startActivity(
-                                                                    activity!!,
-                                                                    intent,
-                                                                    null
-                                                            )
-                                                        }
-                                                        broadcastResult.finish()
-                                                    }
-
-                                                    override fun notImplemented() {
-                                                        throw UnsupportedOperationException()
-                                                    }
-
-                                                    override fun error(
-                                                            code: String,
-                                                            message: String?,
-                                                            details: Any?
-                                                    ) {
-                                                        throw UnsupportedOperationException()
-                                                    }
-                                                }
-                                        )
-                                    }
-                                    BluetoothDevice.PAIRING_VARIANT_PASSKEY_CONFIRMATION,
-                                    3 -> // The simplest, but much less secure method - just yes or
-                                        // no, without any auth.
-                                        // Consent type can use same code as passkey confirmation
-                                        // since passed passkey,
-                                        // which is 0 or error at the moment, should not be used
-                                        // anyway by common code.
-                                    {
-                                        val pairingKey =
-                                                intent.getIntExtra(
-                                                        BluetoothDevice.EXTRA_PAIRING_KEY,
-                                                        BluetoothDevice.ERROR
-                                                )
-
-                                        val arguments: MutableMap<String, Any> = HashMap()
-                                        arguments["address"] = device.address
-                                        arguments["variant"] = pairingVariant
-                                        arguments["pairingKey"] = pairingKey
-
-                                        val broadcastResult = this.goAsync()
-                                        methodChannel!!.invokeMethod(
-                                                "handlePairingRequest",
-                                                arguments,
-                                                object : MethodChannel.Result {
-                                                    @SuppressLint("MissingPermission")
-                                                    override fun success(handlerResult: Any?) {
-                                                        if (handlerResult is Boolean) {
-                                                            try {
-                                                                val confirm = handlerResult
-                                                                Log.d(
-                                                                        TAG,
-                                                                        "Trying to set pairing confirmation to $confirm (key: $pairingKey)"
-                                                                )
-                                                                // @WARN `BLUETOOTH_PRIVILEGED`
-                                                                // permission required, but might be
-                                                                // unavailable for thrid party apps
-                                                                // on newer versions of Androids.
-                                                                device.setPairingConfirmation(
-                                                                        confirm
-                                                                )
-                                                                broadcastResult.abortBroadcast()
-                                                            } catch (ex: Exception) {
-                                                                Log.e(TAG, ex.message!!)
-                                                                ex.printStackTrace()
-                                                                // @TODO , passing the error
-                                                                // result.error("bond_error",
-                                                                // "Auto-confirming pass key
-                                                                // failed", exceptionToString(ex));
-                                                            }
-                                                        } else {
-                                                            Log.d(
-                                                                    TAG,
-                                                                    "Manual passkey confirmation pairing in progress (key: $pairingKey)"
-                                                            )
-                                                            ActivityCompat.startActivity(
-                                                                    activity!!,
-                                                                    intent,
-                                                                    null
-                                                            )
-                                                        }
-                                                        broadcastResult.finish()
-                                                    }
-
-                                                    override fun notImplemented() {
-                                                        throw UnsupportedOperationException()
-                                                    }
-
-                                                    override fun error(
-                                                            code: String,
-                                                            message: String?,
-                                                            details: Any?
-                                                    ) {
-                                                        Log.e(TAG, "$code $message")
-                                                        throw UnsupportedOperationException()
-                                                    }
-                                                }
-                                        )
-                                    }
-                                    4, 5 -> // Same as previous, but for 4 digit pin.
-                                    {
-                                        val pairingKey =
-                                                intent.getIntExtra(
-                                                        BluetoothDevice.EXTRA_PAIRING_KEY,
-                                                        BluetoothDevice.ERROR
-                                                )
-
-                                        val arguments: MutableMap<String, Any> = HashMap()
-                                        arguments["address"] = device.address
-                                        arguments["variant"] = pairingVariant
-                                        arguments["pairingKey"] = pairingKey
-
-                                        methodChannel!!.invokeMethod(
-                                                "handlePairingRequest",
-                                                arguments
-                                        )
-                                    }
-                                    else -> // Only log other pairing variants
-                                    Log.w(TAG, "Unknown pairing variant: $pairingVariant")
-                                }
-                            }
-                            else -> {}
-                        }
-                    }
-                }
-
-        // Discovery
-        discoveryReceiver =
-                object : BroadcastReceiver() {
-                    override fun onReceive(context: Context, intent: Intent) {
-                        val action = intent.action
-                        when (action) {
-                            BluetoothDevice.ACTION_FOUND -> {
-                                val device =
-                                        intent.getParcelableExtra<BluetoothDevice>(
-                                                BluetoothDevice.EXTRA_DEVICE
-                                        )
-                                // final BluetoothClass deviceClass =
-                                // intent.getParcelableExtra(BluetoothDevice.EXTRA_CLASS); // @TODO
-                                // . !BluetoothClass!
-                                // final String extraName =
-                                // intent.getStringExtra(BluetoothDevice.EXTRA_NAME); // @TODO ?
-                                // !EXTRA_NAME!
-                                val deviceRSSI =
-                                        intent.getShortExtra(
-                                                        BluetoothDevice.EXTRA_RSSI,
-                                                        Short.MIN_VALUE
-                                                )
-                                                .toInt()
-
-                                val discoveryResult: MutableMap<String, Any> = HashMap()
-                                discoveryResult["address"] = device!!.address
-                                discoveryResult["name"] = device.name
-                                discoveryResult["type"] = device.type
-                                // discoveryResult.put("class", deviceClass); // @TODO . it isn't my
-                                // priority for now !BluetoothClass!
-                                discoveryResult["isConnected"] = checkIsDeviceConnected(device)
-                                discoveryResult["bondState"] = device.bondState
-                                discoveryResult["rssi"] = deviceRSSI
-
-                                Log.d(TAG, "Discovered " + device.address)
-                                if (discoverySink != null) {
-                                    discoverySink!!.success(discoveryResult)
-                                }
-                            }
-                            BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
-                                Log.d(TAG, "Discovery finished")
-                                try {
-                                    context.unregisterReceiver(this)
-                                } catch (ex: IllegalArgumentException) {
-                                    // Ignore `Receiver not registered` exception
-                                }
-
-                                bluetoothAdapter!!.cancelDiscovery()
-
-                                if (discoverySink != null) {
-                                    discoverySink!!.endOfStream()
-                                    discoverySink = null
-                                }
-                            }
-                            else -> {}
-                        }
-                    }
-                }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.S)
-    private fun ensurePermissions(callbacks: EnsurePermissionsCallback) {
-        if ((ContextCompat.checkSelfPermission(
-                        activity!!,
-                        Manifest.permission.ACCESS_COARSE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED) ||
-                        (ContextCompat.checkSelfPermission(
-                                activity!!,
-                                Manifest.permission.ACCESS_FINE_LOCATION
-                        ) != PackageManager.PERMISSION_GRANTED) ||
-                        (ContextCompat.checkSelfPermission(
-                                activity!!,
-                                Manifest.permission.BLUETOOTH_SCAN
-                        ) != PackageManager.PERMISSION_GRANTED) ||
-                        (ContextCompat.checkSelfPermission(
-                                activity!!,
-                                Manifest.permission.BLUETOOTH_ADVERTISE
-                        ) != PackageManager.PERMISSION_GRANTED) ||
-                        (ContextCompat.checkSelfPermission(
-                                activity!!,
-                                Manifest.permission.BLUETOOTH_CONNECT
-                        ) != PackageManager.PERMISSION_GRANTED)
-        ) {
-            ActivityCompat.requestPermissions(
-                    activity!!,
-                    arrayOf(
-                            Manifest.permission.ACCESS_COARSE_LOCATION,
-                            Manifest.permission.ACCESS_FINE_LOCATION,
-                            Manifest.permission.BLUETOOTH_SCAN,
-                            Manifest.permission.BLUETOOTH_ADVERTISE,
-                            Manifest.permission.BLUETOOTH_CONNECT
-                    ),
-                    REQUEST_COARSE_LOCATION_PERMISSIONS
-            )
-
-            pendingPermissionsEnsureCallbacks = callbacks
-        } else {
-            callbacks.onResult(true)
-        }
-    }
-
-    private inner class FlutterBluetoothSerialMethodCallHandler : MethodCallHandler {
-        /** Provides access to the plugin methods */
-        @RequiresApi(Build.VERSION_CODES.S)
-        override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
-            if (bluetoothAdapter == null) {
-                if ("isAvailable" == call.method) {
-                    result.success(false)
+            "write" -> {
+                val id = call.argument<Int>("id")
+                val bytes = call.argument<ByteArray>("bytes")
+                if (id != null && bytes != null) {
+                    write(result, id, bytes)
                 } else {
-                    result.error("bluetooth_unavailable", "bluetooth is not available", null)
-                }
-                return
-            }
-
-            fun getAddress(): String {
-                try {
-                    val addr = call.argument("address") as String?
-                    if (!BluetoothAdapter.checkBluetoothAddress(addr)) {
-                        throw ClassCastException()
-                    }
-                    return addr!!
-                } catch (ex: ClassCastException) {
                     result.error(
-                            "invalid_argument",
-                            "'address' argument is required to be string containing remote MAC address",
+                            Helper.ERROR_ARGUMENT_MISSING,
+                            "Not all required arguments were specified",
                             null
                     )
-                    throw ex
                 }
             }
+            else -> {
+                result.notImplemented()
+            }
+        }
+    }
 
-            methodCallDispatching@ when (call.method) {
-                "isAvailable" -> result.success(true)
-                "isOn", "isEnabled" -> result.success(bluetoothAdapter!!.isEnabled)
-                "openSettings" -> {
-                    ContextCompat.startActivity(
-                            activity!!,
-                            Intent(Settings.ACTION_BLUETOOTH_SETTINGS),
-                            null
-                    )
-                    result.success(null)
-                }
-                "requestEnable" ->
-                        if (!bluetoothAdapter!!.isEnabled) {
-                            pendingResultForActivityResult = result
-                            val intent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
-                            ActivityCompat.startActivityForResult(
-                                    activity!!,
-                                    intent,
-                                    REQUEST_ENABLE_BLUETOOTH,
-                                    null
-                            )
-                        } else {
-                            result.success(true)
-                        }
-                "requestDisable" ->
-                        if (bluetoothAdapter!!.isEnabled) {
-                            bluetoothAdapter!!.disable()
-                            result.success(true)
-                        } else {
-                            result.success(false)
-                        }
-                "ensurePermissions" ->
-                        ensurePermissions(
-                                EnsurePermissionsCallback { innerResult: Boolean ->
-                                    result.success(innerResult)
-                                }
-                        )
-                "getState" -> result.success(bluetoothAdapter!!.state)
-                "getAddress" -> {
-                    @SuppressLint("MissingPermission", "HardwareIds")
-                    var address = bluetoothAdapter!!.address
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        methodChannel.setMethodCallHandler(null)
+        adapterStateChannel.setStreamHandler(null)
+        binaryMessenger = null
 
-                    if (address == "02:00:00:00:00:00") {
-                        Log.w(
-                                TAG,
-                                "Local Bluetooth MAC address is hidden by system, trying other options..."
-                        )
+        binding.applicationContext.unregisterReceiver(
+                adapterStateReceiver.mBluetoothAdapterStateReceiver
+        )
+        binding.applicationContext.unregisterReceiver(scanResultReceiver.scanResultReceiver)
+        binding.applicationContext.unregisterReceiver(discoveryStateReceiver.discoveryStateReceiver)
+    }
 
-                        do {
-                            Log.d(TAG, "Trying to obtain address using Settings Secure bank")
-                            try {
-                                // Requires `LOCAL_MAC_ADDRESS` which could be unavailible for third
-                                // party applications...
-                                val value =
-                                        Settings.Secure.getString(
-                                                activeContext!!.contentResolver,
-                                                "bluetooth_address"
-                                        )
-                                if (value == null) {
-                                    throw NullPointerException(
-                                            "null returned, might be no permissions problem"
-                                    )
-                                }
-                                address = value
-                                break
-                            } catch (ex: Exception) {
-                                // Ignoring failure (since it isn't critical API for most
-                                // applications)
-                                Log.d(TAG, "Obtaining address using Settings Secure bank failed")
-                                // result.error("hidden_address", "obtaining address using Settings
-                                // Secure bank failed", exceptionToString(ex));
-                            }
+    /**
+     * Checks if the device supports Bluetooth.
+     *
+     * @return True if Bluetooth is supported, false otherwise.
+     */
+    private fun checkBluetoothSupport(): Boolean {
+        return context?.packageManager?.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH) == true
+    }
 
-                            Log.d(
-                                    TAG,
-                                    "Trying to obtain address using reflection against internal Android code"
-                            )
-                            try {
-                                // This will most likely work, but well, it is unsafe
-                                val mServiceField =
-                                        bluetoothAdapter!!.javaClass.getDeclaredField("mService")
-                                mServiceField.isAccessible = true
+    /**
+     * Checks if Bluetooth is enabled on the device.
+     *
+     * @return true if Bluetooth is enabled, false otherwise.
+     */
+    private fun isBluetoothEnabled(): Boolean {
+        return bluetoothAdapter?.isEnabled == true
+    }
 
-                                val bluetoothManagerService = mServiceField[bluetoothAdapter]
-                                if (bluetoothManagerService == null) {
-                                    if (!bluetoothAdapter!!.isEnabled) {
-                                        Log.d(
-                                                TAG,
-                                                "Probably failed just because adapter is disabled!"
-                                        )
-                                    }
-                                    throw NullPointerException()
-                                }
-                                val getAddressMethod =
-                                        bluetoothManagerService.javaClass.getMethod("getAddress")
-                                val value =
-                                        getAddressMethod.invoke(bluetoothManagerService) as String
-                                                ?: throw NullPointerException()
-                                address = value
-                                Log.d(TAG, "Probably succed: $address ✨ :F")
-                                break
-                            } catch (ex: Exception) {
-                                // Ignoring failure (since it isn't critical API for most
-                                // applications)
-                                Log.d(
-                                        TAG,
-                                        "Obtaining address using reflection against internal Android code failed"
-                                )
-                                // result.error("hidden_address", "obtaining address using
-                                // reflection agains internal Android code failed",
-                                // exceptionToString(ex));
-                            }
-
-                            Log.d(
-                                    TAG,
-                                    "Trying to look up address by network interfaces - might be invalid on some devices"
-                            )
-                            try {
-                                // This method might return invalid MAC address (since Bluetooth
-                                // might use other address than WiFi).
-                                // @TODO . further testing: 1) check is while open connection, 2)
-                                // check other devices
-                                val interfaces = NetworkInterface.getNetworkInterfaces()
-                                var value: String? = null
-                                while (interfaces.hasMoreElements()) {
-                                    val networkInterface = interfaces.nextElement()
-                                    val name = networkInterface.name
-
-                                    if (!name.equals("wlan0", ignoreCase = true)) {
-                                        continue
-                                    }
-
-                                    val addressBytes = networkInterface.hardwareAddress
-                                    if (addressBytes != null) {
-                                        val addressBuilder = StringBuilder(18)
-                                        for (b in addressBytes) {
-                                            addressBuilder.append(String.format("%02X:", b))
-                                        }
-                                        addressBuilder.setLength(17)
-                                        value = addressBuilder.toString()
-                                        //     Log.v(TAG, "-> '" + name + "' : " + value);
-                                        // }
-                                        // else {
-                                        //    Log.v(TAG, "-> '" + name + "' : <no hardware
-                                        // address>");
-                                    }
-                                }
-                                if (value == null) {
-                                    throw NullPointerException()
-                                }
-                                address = value
-                            } catch (ex: Exception) {
-                                // Ignoring failure (since it isn't critical API for most
-                                // applications)
-                                Log.w(TAG, "Looking for address by network interfaces failed")
-                                // result.error("hidden_address", "looking for address by network
-                                // interfaces failed", exceptionToString(ex));
-                            }
-                        } while (false)
-                    }
-                    result.success(address)
-                }
-                "getName" -> result.success(bluetoothAdapter!!.name)
-                "setName" -> {
-                    if (!call.hasArgument("name")) {
-                        result.error("invalid_argument", "argument 'name' not found", null)
-                    }
-
-                    val name: String?
-                    try {
-                        name = call.argument("name")
-                        result.success(bluetoothAdapter!!.setName(name))
-                    } catch (ex: ClassCastException) {
-                        result.error(
-                                "invalid_argument",
-                                "'name' argument is required to be string",
+    /**
+     * Turns on Bluetooth if it's not already enabled.
+     *
+     * @param result The [Result] object to return the result of the operation.
+     */
+    private fun requestEnable(result: Result) {
+        if (isBluetoothEnabled()) {
+            result.success(null)
+            return
+        }
+        val permissions = ArrayList<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        permissionManager.ensurePermissions(permissions.toTypedArray()) {
+                success: Boolean,
+                deniedPermissions: List<String>? ->
+            run {
+                try {
+                    if (success) {
+                        val enableBtIntent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
+                        startActivityForResult(
+                                activityPluginBinding!!.activity,
+                                enableBtIntent,
+                                PermissionManager.REQUEST_ENABLE_BT,
                                 null
                         )
+                        result.success(null)
+                        return@run
                     }
-                }
-                "getDeviceBondState" -> {
-                    if (!call.hasArgument("address")) {
-                        result.error("invalid_argument", "argument 'address' not found", null)
-                    }
+                } catch (_: Exception) {}
+                result.error(
+                        Helper.ERROR_PERMISSION_DENIED,
+                        String.format(
+                                "Required permission(s) %s denied",
+                                deniedPermissions?.joinToString() ?: ""
+                        ),
+                        null
+                )
+            }
+        }
+    }
 
-                    val address = getAddress()
+    /** Retrieves the current state of the Bluetooth adapter as a string. */
+    private fun getAdapterState(): String {
+        return bluetoothAdapter?.state?.let { Helper.adapterStateString(it) } ?: "unavailable"
+    }
 
-                    val device = bluetoothAdapter!!.getRemoteDevice(address)
-                    result.success(device.bondState)
-                }
-                "removeDeviceBond" -> {
-                    if (!call.hasArgument("address")) {
-                        result.error("invalid_argument", "argument 'address' not found", null)
-                    }
+    /**
+     * Retrieves a list of bonded (paired) Bluetooth devices.
+     *
+     * @param result The [Result] object to return the scanning status.
+     * ```
+     *               Returns the list of bonded devices.
+     * ```
+     */
+    @SuppressLint("MissingPermission")
+    private fun getBondedDevices(result: Result) {
+        val permissions = ArrayList<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        permissionManager.ensurePermissions(permissions.toTypedArray()) {
+                success: Boolean,
+                deniedPermissions: List<String>? ->
+            run {
+                if (success) {
+                    val devices: List<MutableMap<String, Any?>>? =
+                            bluetoothAdapter?.bondedDevices
+                                    ?.filter { it.type != BluetoothDevice.DEVICE_TYPE_LE }
+                                    ?.map { Helper.bluetoothDeviceToMap(it) }
 
-                    val address = getAddress()
-                    val device = bluetoothAdapter!!.getRemoteDevice(address)
-                    when (device.bondState) {
-                        BluetoothDevice.BOND_BONDING -> {
-                            result.error("bond_error", "device already bonding", null)
-                        }
-                        BluetoothDevice.BOND_NONE -> {
-                            result.error("bond_error", "device already unbonded", null)
-                        }
-                        else -> {}
-                    }
-
-                    try {
-                        val method = device.javaClass.getMethod("removeBond")
-                        val value = method.invoke(device) as Boolean
-                        result.success(value)
-                    } catch (ex: Exception) {
-                        result.error("bond_error", "error while unbonding", exceptionToString(ex))
-                    }
-                }
-                "bondDevice" -> {
-                    if (!call.hasArgument("address")) {
-                        result.error("invalid_argument", "argument 'address' not found", null)
-                    }
-
-                    val address = getAddress()
-
-                    if (bondStateBroadcastReceiver != null) {
-                        result.error(
-                                "bond_error",
-                                "another bonding process is ongoing from local device",
-                                null
-                        )
-                    }
-
-                    val device = bluetoothAdapter!!.getRemoteDevice(address)
-                    when (device.bondState) {
-                        BluetoothDevice.BOND_BONDING -> {
-                            result.error("bond_error", "device already bonding", null)
-                        }
-                        BluetoothDevice.BOND_BONDED -> {
-                            result.error("bond_error", "device already bonded", null)
-                        }
-                        else -> {}
-                    }
-
-                    bondStateBroadcastReceiver =
-                            object : BroadcastReceiver() {
-                                override fun onReceive(context: Context, intent: Intent) {
-                                    when (intent.action) {
-                                        BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
-                                            val someDevice =
-                                                    intent.getParcelableExtra<BluetoothDevice>(
-                                                            BluetoothDevice.EXTRA_DEVICE
-                                                    )
-                                            if (someDevice != device) {
-                                                return
-                                            }
-
-                                            val newBondState =
-                                                    intent.getIntExtra(
-                                                            BluetoothDevice.EXTRA_BOND_STATE,
-                                                            BluetoothDevice.ERROR
-                                                    )
-                                            when (newBondState) {
-                                                BluetoothDevice
-                                                        .BOND_BONDING -> // Wait for true bond
-                                                        // result :F
-                                                        return
-                                                BluetoothDevice.BOND_BONDED -> result.success(true)
-                                                BluetoothDevice.BOND_NONE -> result.success(false)
-                                                else ->
-                                                        result.error(
-                                                                "bond_error",
-                                                                "invalid bond state while bonding",
-                                                                null
-                                                        )
-                                            }
-                                            activeContext!!.unregisterReceiver(this)
-                                            bondStateBroadcastReceiver = null
-                                        }
-                                        else -> {}
-                                    }
-                                }
-                            }
-
-                    val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
-                    // filter.setPriority(pairingRequestReceiverPriority + 1);
-                    activeContext!!.registerReceiver(bondStateBroadcastReceiver, filter)
-
-                    if (!device.createBond()) {
-                        result.error("bond_error", "error starting bonding process", null)
-                    }
-                }
-                "pairingRequestHandlingEnable" -> {
-                    if (this@BluetoothClassicMultiplatformPlugin.isPairingRequestHandlerSet) {
-                        result.error(
-                                "logic_error",
-                                "pairing request handling is already enabled",
-                                null
-                        )
-                        return
-                    }
-                    Log.d(TAG, "Starting listening for pairing requests to handle")
-
-                    this@BluetoothClassicMultiplatformPlugin.isPairingRequestHandlerSet = true
-                    val filter = IntentFilter(BluetoothDevice.ACTION_PAIRING_REQUEST)
-                    // filter.setPriority(pairingRequestReceiverPriority);
-                    activeContext!!.registerReceiver(pairingRequestReceiver, filter)
-                }
-                "pairingRequestHandlingDisable" -> {
-                    this@BluetoothClassicMultiplatformPlugin.isPairingRequestHandlerSet = false
-                    try {
-                        activeContext!!.unregisterReceiver(pairingRequestReceiver)
-                        Log.d(TAG, "Stopped listening for pairing requests to handle")
-                    } catch (ex: IllegalArgumentException) {
-                        // Ignore `Receiver not registered` exception
-                    }
-                }
-                "getBondedDevices" ->
-                        ensurePermissions { granted: Boolean ->
-                            if (!granted) {
-                                result.error(
-                                        "no_permissions",
-                                        "discovering other devices requires location access permission",
-                                        null
-                                )
-                                return@ensurePermissions
-                            }
-                            val list: MutableList<Map<String, Any>> = ArrayList()
-                            for (device in bluetoothAdapter!!.bondedDevices) {
-                                val entry: MutableMap<String, Any> = HashMap()
-                                entry["address"] = device.address
-                                entry["name"] = device.name
-                                entry["type"] = device.type
-                                entry["isConnected"] = checkIsDeviceConnected(device)
-                                entry["bondState"] = BluetoothDevice.BOND_BONDED
-                                list.add(entry)
-                            }
-                            result.success(list)
-                        }
-                "isDiscovering" -> result.success(bluetoothAdapter!!.isDiscovering)
-                "startDiscovery" ->
-                        ensurePermissions { granted: Boolean ->
-                            if (!granted) {
-                                result.error(
-                                        "no_permissions",
-                                        "discovering other devices requires location access permission",
-                                        null
-                                )
-                                return@ensurePermissions
-                            }
-                            Log.d(TAG, "Starting discovery")
-                            val intent = IntentFilter()
-                            intent.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
-                            intent.addAction(BluetoothDevice.ACTION_FOUND)
-                            activeContext!!.registerReceiver(discoveryReceiver, intent)
-
-                            bluetoothAdapter!!.startDiscovery()
-                            result.success(null)
-                        }
-                "cancelDiscovery" -> {
-                    Log.d(TAG, "Canceling discovery")
-                    try {
-                        activeContext!!.unregisterReceiver(discoveryReceiver)
-                    } catch (ex: IllegalArgumentException) {
-                        // Ignore `Receiver not registered` exception
-                    }
-
-                    bluetoothAdapter!!.cancelDiscovery()
-
-                    if (discoverySink != null) {
-                        discoverySink!!.endOfStream()
-                        discoverySink = null
-                    }
-
-                    result.success(null)
-                }
-                "isDiscoverable" ->
-                        result.success(
-                                bluetoothAdapter!!.scanMode ==
-                                        BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE
-                        )
-                "requestDiscoverable" -> {
-                    val intent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
-
-                    if (call.hasArgument("duration")) {
-                        try {
-                            val duration = call.argument<Any>("duration") as Int
-                            intent.putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, duration)
-                        } catch (ex: ClassCastException) {
-                            result.error(
-                                    "invalid_argument",
-                                    "'duration' argument is required to be integer",
-                                    null
-                            )
-                            return
-                        }
-                    }
-
-                    pendingResultForActivityResult = result
-                    ActivityCompat.startActivityForResult(
-                            activity!!,
-                            intent,
-                            REQUEST_DISCOVERABLE_BLUETOOTH,
+                    result.success(devices)
+                } else {
+                    result.error(
+                            Helper.ERROR_PERMISSION_DENIED,
+                            String.format(
+                                    "Required permission(s) %s denied",
+                                    deniedPermissions?.joinToString() ?: ""
+                            ),
                             null
                     )
                 }
-                "connect" -> {
-                    if (!call.hasArgument("address")) {
-                        result.error("invalid_argument", "argument 'address' not found", null)
-                        return
-                    }
+            }
+        }
+    }
 
-                    val isLE =
-                            call.hasArgument("isLE") &&
-                                    java.lang.Boolean.TRUE == call.argument<Boolean>("isLE")
+    /**
+     * Starts a Bluetooth discovery process.
+     *
+     * @param result The [Result] object to return the scanning status.
+     * ```
+     *               Returns true if discovery started, false otherwise.
+     * @param usesFineLocation
+     * ```
+     * A boolean indicating whether ACCESS_FINE_LOCATION permission
+     * ```
+     *                         is required for the scan. This is typically true if the scan
+     *                         needs to derive physical location from Bluetooth beacons.
+     * ```
+     */
+    @SuppressLint("MissingPermission")
+    private fun startScan(result: Result, usesFineLocation: Boolean) {
+        val permissions = ArrayList<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (usesFineLocation) {
+            permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
 
-                    val address: String?
-                    try {
-                        address = call.argument("address")
-                        if (!BluetoothAdapter.checkBluetoothAddress(address)) {
-                            throw ClassCastException()
-                        }
-                    } catch (ex: ClassCastException) {
-                        result.error(
-                                "invalid_argument",
-                                "'address' argument is required to be string containing remote MAC address",
-                                null
-                        )
-                        return
-                    }
-
-                    val connection: BluetoothConnection
-                    val connection0 = arrayOf<BluetoothConnection?>(null)
-
-                    val id = ++lastConnectionId
-
-                    val readSink = arrayOf<EventSink?>(null)
-
-                    // I think this code is to effect disconnection when the plugin is unloaded or
-                    // something?
-                    val readChannel = EventChannel(messenger, PLUGIN_NAMESPACE + "/read/" + id)
-                    // If canceled by local, disconnects - in other case, by remote, does nothing
-                    // True dispose
-                    val readStreamHandler: EventChannel.StreamHandler =
-                            object : EventChannel.StreamHandler {
-                                override fun onListen(o: Any?, eventSink: EventSink) {
-                                    readSink[0] = eventSink
-                                }
-
-                                override fun onCancel(o: Any?) {
-                                    // If canceled by local, disconnects - in other case, by remote,
-                                    // does nothing
-                                    connection0[0]!!.disconnect()
-
-                                    // True dispose
-                                    AsyncTask.execute {
-                                        readChannel.setStreamHandler(null)
-                                        connections.remove(id)
-                                        Log.d(TAG, "Disconnected (id: $id)")
-                                    }
-                                }
-                            }
-                    readChannel.setStreamHandler(
-                            readStreamHandler
-                    ) // LEAK //THINK I don't know if this should go after the BluetoothConnection
-                    // is created or not
-
-                    val orc: OnReadCallback =
-                            object : OnReadCallback {
-                                override fun onRead(data: ByteArray) {
-                                    activity!!.runOnUiThread {
-                                        if (readSink[0] != null) {
-                                            readSink[0]!!.success(data)
-                                        }
-                                    }
-                                }
-                            }
-
-                    val odc: OnDisconnectedCallback =
-                            object : OnDisconnectedCallback {
-                                override fun onDisconnected(byRemote: Boolean) {
-                                    activity!!.runOnUiThread {
-                                        if (byRemote) {
-                                            Log.d(TAG, "onDisconnected by remote (id: $id)")
-                                            if (readSink[0] != null) {
-                                                readSink[0]!!.endOfStream()
-                                                readSink[0] = null
-                                            }
-                                        } else {
-                                            Log.d(TAG, "onDisconnected by local (id: $id)")
-                                        }
-                                    }
-                                }
-                            }
-
-                    connection0[0] = BluetoothConnectionClassic(orc, odc, bluetoothAdapter!!)
-                    connection = connection0[0]!!
-                    connections.put(id, connection)
-
-                    Log.d(TAG, "Connecting to $address (id: $id)")
-
-                    AsyncTask.execute {
-                        try {
-                            connection.connect(address!!)
-                            activity!!.runOnUiThread { result.success(id) }
-                        } catch (ex: Exception) {
-                            activity!!.runOnUiThread {
-                                result.error("connect_error", ex.message, exceptionToString(ex))
-                            }
-                            connections.remove(id)
-                        }
-                    }
+        permissionManager.ensurePermissions(permissions.toTypedArray()) {
+                success: Boolean,
+                deniedPermissions: List<String>? ->
+            run {
+                if (success) {
+                    val discoveryStartState = bluetoothAdapter?.startDiscovery()
+                    result.success(discoveryStartState)
+                } else {
+                    result.error(
+                            Helper.ERROR_PERMISSION_DENIED,
+                            String.format(
+                                    "Required permission(s) %s denied",
+                                    deniedPermissions?.joinToString() ?: ""
+                            ),
+                            null
+                    )
                 }
-                "write" -> {
-                    if (!call.hasArgument("id")) {
-                        result.error("invalid_argument", "argument 'id' not found", null)
-                        return
-                    }
+            }
+        }
+    }
 
-                    val id: Int
-                    try {
-                        id = call.argument("id")!!
-                    } catch (ex: ClassCastException) {
-                        result.error(
-                                "invalid_argument",
-                                "'id' argument is required to be integer id of connection",
-                                null
-                        )
-                        return
-                    }
+    /**
+     * Stops an ongoing Bluetooth device discovery.
+     *
+     * @param result The [Result] object to send the outcome of the operation.
+     * ```
+     *               Returns true if discovery is stopped, false otherwise.
+     * ```
+     */
+    @SuppressLint("MissingPermission")
+    private fun stopScan(result: Result) {
+        val permissions = ArrayList<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+        }
 
-                    val connection = connections[id]
-                    if (connection == null) {
-                        result.error(
-                                "invalid_argument",
-                                "there is no connection with provided id",
-                                null
-                        )
-                        return
-                    }
-
-                    if (call.hasArgument("string")) {
-                        val string = call.argument<String>("string")
-                        AsyncTask.execute {
-                            try {
-                                connection.write(string!!.toByteArray())
-                                activity!!.runOnUiThread { result.success(null) }
-                            } catch (ex: Exception) {
-                                activity!!.runOnUiThread {
-                                    result.error("write_error", ex.message, exceptionToString(ex))
-                                }
-                            }
-                        }
-                    } else if (call.hasArgument("bytes")) {
-                        val bytes = call.argument<ByteArray>("bytes")
-                        AsyncTask.execute {
-                            try {
-                                connection.write(bytes!!)
-                                activity!!.runOnUiThread { result.success(null) }
-                            } catch (ex: Exception) {
-                                activity!!.runOnUiThread {
-                                    result.error("write_error", ex.message, exceptionToString(ex))
-                                }
-                            }
-                        }
-                    } else {
-                        result.error(
-                                "invalid_argument",
-                                "there must be 'string' or 'bytes' argument",
-                                null
-                        )
-                    }
+        permissionManager.ensurePermissions(permissions.toTypedArray()) {
+                success: Boolean,
+                deniedPermissions: List<String>? ->
+            run {
+                if (success) {
+                    result.success(bluetoothAdapter?.cancelDiscovery())
+                } else {
+                    result.error(
+                            Helper.ERROR_PERMISSION_DENIED,
+                            String.format(
+                                    "Required permission(s) %s denied",
+                                    deniedPermissions?.joinToString() ?: ""
+                            ),
+                            null
+                    )
                 }
-                else -> result.notImplemented()
+            }
+        }
+    }
+
+    /**
+     * Checks if the Bluetooth adapter is currently discovering devices.
+     *
+     * @param result The [Result] object to return the scanning status.
+     * ```
+     *               Returns true if discovering, false otherwise.
+     * ```
+     */
+    @SuppressLint("MissingPermission")
+    private fun isScanningNow(result: Result) {
+        val permissions = ArrayList<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+        }
+
+        permissionManager.ensurePermissions(permissions.toTypedArray()) {
+                success: Boolean,
+                deniedPermissions: List<String>? ->
+            run {
+                if (success) {
+                    result.success(bluetoothAdapter?.isDiscovering ?: false)
+                } else {
+                    result.error(
+                            Helper.ERROR_PERMISSION_DENIED,
+                            String.format(
+                                    "Required permission(s) %s denied",
+                                    deniedPermissions?.joinToString() ?: ""
+                            ),
+                            null
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Attempts to bond (pair) with a Bluetooth device.
+     *
+     * @param result The [Result] object to return the outcome of the bonding attempt.
+     * ```
+     *               Returns true if bonding is initiated, false otherwise.
+     * @param address
+     * ```
+     * The MAC address of the Bluetooth device to bond with.
+     */
+    @SuppressLint("MissingPermission")
+    private fun bondDevice(result: Result, address: String) {
+        if (!BluetoothAdapter.checkBluetoothAddress(address)) {
+            result.error(
+                    Helper.ERROR_ADDRESS_INVALID,
+                    "The bluetooth address $address is invalid",
+                    null
+            )
+            return
+        }
+
+        val permissions = ArrayList<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+
+        permissionManager.ensurePermissions(permissions.toTypedArray()) {
+                success: Boolean,
+                deniedPermissions: List<String>? ->
+            run {
+                if (success) {
+                    val device = bluetoothAdapter?.getRemoteDevice(address)
+                    result.success(device?.createBond() == true)
+                } else {
+                    result.error(
+                            Helper.ERROR_PERMISSION_DENIED,
+                            String.format(
+                                    "Required permission(s) %s denied",
+                                    deniedPermissions?.joinToString() ?: ""
+                            ),
+                            null
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Connects to a Bluetooth device.
+     *
+     * This function attempts to establish a connection with a Bluetooth device specified by its MAC
+     * address. If a UUID is provided, it attempts to parse it. An invalid UUID will result in an
+     * error. A new connection ID is generated, and a [BluetoothConnectionWrapper] is created and
+     * stored.
+     *
+     * @param result The [Result] object to report success or failure of the connection attempt.
+     * ```
+     *               Returns the id of the new connection.
+     * @param address
+     * ```
+     * The MAC address of the Bluetooth device to connect to.
+     * @param uuid An optional UUID string for the service to connect to. If null, a default or
+     * pre-configured UUID might be used by the underlying connection mechanism.
+     */
+    @SuppressLint("MissingPermission")
+    private fun connect(result: Result, address: String, uuid: String?) {
+        var permissionSuccess = true
+        val permissions = ArrayList<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+        }
+
+        permissionManager.ensurePermissions(permissions.toTypedArray()) {
+                success: Boolean,
+                deniedPermissions: List<String>? ->
+            if (!success) {
+                result.error(
+                        Helper.ERROR_PERMISSION_DENIED,
+                        String.format(
+                                "Required permission(s) %s denied",
+                                deniedPermissions?.joinToString() ?: ""
+                        ),
+                        null
+                )
+            }
+            permissionSuccess = success
+        }
+
+        if (!permissionSuccess) return
+
+        if (!BluetoothAdapter.checkBluetoothAddress(address)) {
+            result.error(
+                    Helper.ERROR_ADDRESS_INVALID,
+                    "The bluetooth address $address is invalid",
+                    null
+            )
+            return
+        }
+
+        val connectUuid =
+                try {
+                    uuid?.let { UUID.fromString(it) }
+                } catch (_: Exception) {
+                    result.error(Helper.ERROR_UUID_INVALID, "$uuid is not a valid UUID.", null)
+                    return
+                }
+
+        val id = ++lastConnectionId
+        val connection = BluetoothConnectionWrapper(id, bluetoothAdapter!!)
+        connections.put(id, connection)
+        Log.d(TAG, "Connecting to $address (id: $id)")
+
+        Thread {
+            try {
+                connection.connect(address, connectUuid)
+                activityPluginBinding!!.activity.runOnUiThread { result.success(id) }
+            } catch (ex: java.lang.Exception) {
+                activityPluginBinding!!.activity.runOnUiThread {
+                    result.error(Helper.ERROR_COULD_NOT_CONNECT, ex.message, null)
+                }
+                connections.remove(id)
+            }
+        }
+                .also { it.start() }
+    }
+
+    /**
+     * Writes [bytes] to the connection identified by [id].
+     *
+     * @param result The [Result] object to report result of the operation.
+     *
+     * @param id The id of the Bluetooth connection.
+     * @param bytes The [ByteArray] to be written to the connection.
+     */
+    private fun write(result: Result, id: Int, bytes: ByteArray) {
+        val connection: BluetoothConnection =
+                try {
+                    connections.get(id) ?: throw Exception("Connection with id $id does not exist.")
+                } catch (_: Exception) {
+                    activityPluginBinding!!.activity.runOnUiThread {
+                        result.error(
+                                Helper.ERROR_CONNECTION_INVALID,
+                                "The connection with id $id does not exist.",
+                                null
+                        )
+                    }
+                    return
+                }
+        Thread {
+            try {
+                connection.write(bytes)
+                activityPluginBinding!!.activity.runOnUiThread { result.success(null) }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during write. Connection might have closed.", e)
+                activityPluginBinding!!.activity.runOnUiThread {
+                    result.error(
+                            Helper.ERROR_WRITE_FAILED,
+                            "Error during write occurred. Connection might have closed.",
+                            null
+                    )
+                }
+            }
+        }
+                .also { it.start() }
+    }
+
+    // ------ INNER CLASS ------
+
+    private inner class BluetoothConnectionWrapper(private val id: Int, adapter: BluetoothAdapter) :
+            BluetoothConnection(adapter), EventChannel.StreamHandler {
+        private var readSink: EventSink? = null
+        private var readChannel: EventChannel =
+                EventChannel(binaryMessenger, Helper.NAMESPACE + "/connection/" + id)
+
+        init {
+            readChannel.setStreamHandler(this)
+        }
+
+        /**
+         * Callback for reading data. This function is called when data is received from the
+         * connected Bluetooth device. This method sends the received data to flutter.
+         *
+         * @param data The byte array containing the received data.
+         */
+        override fun onRead(data: ByteArray) {
+            activityPluginBinding?.activity?.runOnUiThread { readSink?.success(data) }
+        }
+
+        /**
+         * Callback for disconnection.
+         *
+         * This method is called when the Bluetooth connection is terminated.
+         *
+         * @param byRemote `true` if the disconnection was initiated by the remote device,
+         * ```
+         *                 `false` if it was initiated locally (e.g., by calling [disconnect]).
+         * ```
+         */
+        override fun onDisconnected(byRemote: Boolean) {
+            activityPluginBinding?.activity?.runOnUiThread {
+                if (byRemote) {
+                    Log.d(TAG, "onDisconnected by remote (id: $id)")
+                    readSink?.endOfStream()
+                    readSink = null
+                } else {
+                    Log.d(TAG, "onDisconnected by local (id: $id)")
+                }
+            }
+        }
+
+        /**
+         * Called when the event channel is first listened to. It receives the [readSink] for
+         * sending received data to flutter.
+         *
+         * @param obj Arbitrary arguments for the stream, can be null.
+         * @param eventSink The [EventSink] to which events are sent.
+         */
+        override fun onListen(obj: Any?, eventSink: EventSink) {
+            readSink = eventSink
+        }
+
+        /**
+         * Called when the connection is closed from the Flutter side.
+         *
+         * It disconnects the Bluetooth connection, sets the stream handler to null, removes the
+         * connection from the `connections` map, and logs the disconnection.
+         */
+        override fun onCancel(obj: Any?) {
+            this.disconnect()
+
+            Executors.newSingleThreadExecutor().execute {
+                Handler(Looper.getMainLooper()).post {
+                    readChannel.setStreamHandler(null)
+                    connections.remove(id)
+                    Log.d(TAG, "Disconnected (id: $id)")
+                }
             }
         }
     }

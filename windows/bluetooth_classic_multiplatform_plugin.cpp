@@ -44,7 +44,7 @@ void BluetoothClassicMultiplatformPlugin::RegisterWithRegistrar(
     // Register the discovery channel
     auto discovery_channel =
         std::make_unique<flutter::EventChannel<flutter::EncodableValue>>(
-            messenger, TAG + "/discovery", codec);
+            messenger, TAG + "/scanResults", codec);
 
     auto discovery_handler = std::make_unique<SinkStreamHandler>();
     plugin->discovery_handler_ptr = discovery_handler.get();
@@ -116,7 +116,7 @@ void BluetoothClassicMultiplatformPlugin::HandleMethodCall(
     }
 
     // State channel methods
-    else if (method == "isAvailable") {
+    else if (method == "isSupported") {
         result->Success(flutter::EncodableValue(IsBluetoothAvailable()));
     } else if (method == "isEnabled") {
         result->Success(flutter::EncodableValue(IsBluetoothEnabled()));
@@ -131,10 +131,10 @@ void BluetoothClassicMultiplatformPlugin::HandleMethodCall(
     } else if (method == "getPairedDevices") {
         auto devices = GetPairedDevices();
         result->Success(flutter::EncodableValue(devices));
-    } else if (method == "startDiscovery") {
+    } else if (method == "startScan") {
         result->Success(true);
         StartDiscovery();
-    } else if (method == "stopDiscovery") {
+    } else if (method == "stopScan") {
         result->Success(flutter::EncodableValue(true));
     } else if (method == "isDiscovering") {
         result->Success(flutter::EncodableValue(false));
@@ -333,12 +333,13 @@ void BluetoothClassicMultiplatformPlugin::StartDiscovery() {
                 flutter::EncodableValue(name);
             device[flutter::EncodableValue("address")] =
                 flutter::EncodableValue(std::string(addressStr));
-            device[flutter::EncodableValue("type")] =
+            device[flutter::EncodableValue("deviceType")] =
                 flutter::EncodableValue("classic");
             device[flutter::EncodableValue("isConnected")] =
                 flutter::EncodableValue(deviceInfo.fConnected == TRUE);
-            device[flutter::EncodableValue("isPaired")] =
-                flutter::EncodableValue(deviceInfo.fAuthenticated == TRUE);
+            device[flutter::EncodableValue("bondState")] =
+                flutter::EncodableValue(
+                    deviceInfo.fAuthenticated == TRUE ? "bonded" : "none");
 
             discovery_handler_ptr->sink->Success(device);
 

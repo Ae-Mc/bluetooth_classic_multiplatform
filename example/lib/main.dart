@@ -18,15 +18,33 @@ class _MyAppState extends State<MyApp> {
   bool? _bluetoothAvailable;
   bool? _bluetoothEnabled;
   final _bluetoothClassicMultiplatformPlugin = BluetoothClassicMultiplatform();
-  final Set<BluetoothDiscoveryResult> discoveredDevices = {};
-  Stream<BluetoothDiscoveryResult>? discoveryStream;
+  final Set<BluetoothDevice> discoveredDevices = {};
+  late final Stream<BluetoothDevice> discoveryStream;
 
   StreamSubscription<BluetoothDevice>? subs;
+
+  BluetoothConnection? connection;
+
+  bool _isScanning = false;
 
   @override
   void initState() {
     super.initState();
+    discoveryStream = _bluetoothClassicMultiplatformPlugin.scanResults;
+    _bluetoothClassicMultiplatformPlugin.scanResults.listen((device) {
+      print("Discovered device: $device");
+      setState(() {
+        discoveredDevices.add(device);
+      });
+    });
+    _bluetoothClassicMultiplatformPlugin.isScanning.listen((isScanning) {
+      print("Is scanning: $isScanning");
+      setState(() {
+        _isScanning = isScanning;
+      });
+    });
     initPlatformState();
+    print('State initialized');
   }
 
   // Platform messages are asynchronous, so we initialize in an async method.
@@ -34,7 +52,7 @@ class _MyAppState extends State<MyApp> {
     // Platform messages may fail, so we use a try/catch PlatformException.
     // We also handle the message potentially returning null.
     final bluetoothAvailable =
-        await _bluetoothClassicMultiplatformPlugin.isAvailable;
+        await _bluetoothClassicMultiplatformPlugin.isSupported;
     final bluetoothEnabled =
         await _bluetoothClassicMultiplatformPlugin.isEnabled;
 
@@ -67,61 +85,44 @@ Bluetooth enabled: $_bluetoothEnabled''', textAlign: TextAlign.center),
                     ? "Выключить Bluetooth"
                     : "Включить Bluetooth",
                 onPressed: () async {
-                  await _bluetoothClassicMultiplatformPlugin
-                      .ensurePermissions();
                   final enabled =
                       await _bluetoothClassicMultiplatformPlugin.isEnabled;
-                  if (enabled) {
-                    final enabled = await _bluetoothClassicMultiplatformPlugin
-                        .requestDisable();
-                    setState(() {
-                      _bluetoothEnabled = enabled;
-                    });
-                  } else {
-                    final enabled = await _bluetoothClassicMultiplatformPlugin
-                        .requestEnable();
-                    setState(() {
-                      _bluetoothEnabled = enabled;
-                    });
-                  }
+                  _bluetoothClassicMultiplatformPlugin.requestEnable();
+                  await _bluetoothClassicMultiplatformPlugin.isEnabled;
+                  setState(() {
+                    _bluetoothEnabled = enabled;
+                  });
                 },
               ),
               SizedBox(height: 16),
               Expanded(
-                child: StreamBuilder(
-                  stream: discoveryStream,
-                  builder: (context, snapshot) {
-                    print(
-                      "Device: ${snapshot.data}. ConnectionState: ${snapshot.connectionState}",
-                    );
-                    if (snapshot.connectionState == ConnectionState.waiting) {
+                child: Builder(
+                  builder: (context) {
+                    if (_isScanning) {
                       return Center(
                         child: CircularProgressIndicator.adaptive(),
                       );
-                    }
-                    if (snapshot.hasData) {
-                      discoveredDevices.add(snapshot.requireData);
                     }
                     return ListView(
                       children: discoveredDevices
                           .map(
                             (e) => ListTile(
-                              onTap: () {
-                                _bluetoothClassicMultiplatformPlugin.connect(
-                                  e.device.address,
-                                );
+                              onTap: () async {
+                                connection =
+                                    await _bluetoothClassicMultiplatformPlugin
+                                        .connect(e.address);
                               },
-                              title: Text(e.device.name ?? ''),
-                              subtitle: Text(e.device.address),
+                              title: Text(e.name ?? ''),
+                              subtitle: Text(e.address),
                               leading: Icon(
                                 Icons.circle,
-                                color: e.device.isBonded
+                                color: e.bondState == BluetoothBondState.bonded
                                     ? Colors.amber
                                     : Colors.blueGrey,
                               ),
                               trailing: Icon(
                                 Icons.bluetooth,
-                                color: e.device.isConnected
+                                color: connection?.address == e.address
                                     ? Colors.green
                                     : Colors.blueGrey,
                               ),
@@ -138,8 +139,7 @@ Bluetooth enabled: $_bluetoothEnabled''', textAlign: TextAlign.center),
                   print("Device search starting...");
                   setState(() {
                     discoveredDevices.clear();
-                    discoveryStream = _bluetoothClassicMultiplatformPlugin
-                        .startDiscovery();
+                    _bluetoothClassicMultiplatformPlugin.startScan();
                     print("Discovery started");
                   });
                 },
